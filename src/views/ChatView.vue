@@ -1,50 +1,140 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { apiClient } from '@/services/apiClient'
+import { ref, onMounted, onUnmounted } from 'vue'
+import { useChatHub } from '@/composables/useChatHub'
+import { useApi } from '@/composables/useApi'
 import type { Message } from '@/types/api'
 
-// Debuggaus - voit poistaa myöhemmin
-console.log('API Base URL:', import.meta.env.VITE_API_BASE_URL)
+const { connection, isConnected, connect, disconnect } = useChatHub()
+const api = useApi()
 
 // Reactive state
 const userMessage = ref('')
 const messages = ref<Message[]>([])
-//const conversationId = ref<string>() // Voidaan ottaa käyttöön myöhemmin
-const isLoading = ref(false)
+const conversationId = ref<string | null>(null)
+const streamingMessage = ref('')
+const isStreaming = ref(false)
 const error = ref<string>()
+
+onMounted(async () => {
+  // Connect to SignalR
+  try {
+    await connect()
+    console.log('✅ SignalR connected - real-time streaming enabled')
+  } catch (err) {
+    console.warn('⚠️ SignalR not available, will use HTTP fallback')
+  }
+
+  // Setup SignalR event handlers
+  connection.on('ReceiveChunk', (chunk: string) => {
+    streamingMessage.value += chunk
+  })
+
+  connection.on('ReceiveComplete', async () => {
+    isStreaming.value = false
+
+    // Add the completed message to history
+    if (streamingMessage.value) {
+      messages.value.push({
+        role: 'assistant',
+        content: streamingMessage.value,
+      })
+      streamingMessage.value = ''
+    }
+
+    // Reload conversation history if needed
+    if (conversationId.value) {
+      await loadHistory(conversationId.value)
+    }
+  })
+
+  connection.on('ReceiveError', (errorMsg: string) => {
+    console.error('SignalR streaming error:', errorMsg)
+    isStreaming.value = false
+    streamingMessage.value = ''
+    error.value = errorMsg
+
+    messages.value.push({
+      role: 'assistant',
+      content: '❌ Virhe: ' + errorMsg,
+    })
+  })
+
+  // Load or create conversation
+  await initConversation()
+})
+
+onUnmounted(() => {
+  disconnect()
+})
+
+async function initConversation() {
+  try {
+    const conversations = await api.getConversations()
+
+    if (conversations.length > 0) {
+      conversationId.value = conversations[0].id
+      await loadHistory(conversations[0].id)
+    } else {
+      const newConv = await api.createConversation('New Chat')
+      conversationId.value = newConv.id
+    }
+  } catch (err) {
+    console.error('Failed to initialize conversation:', err)
+    // Continue without conversation ID - HTTP fallback will still work
+  }
+}
+
+async function loadHistory(id: string) {
+  try {
+    const history = await api.getConversationHistory(id)
+    messages.value = history
+  } catch (err) {
+    console.error('Failed to load conversation history:', err)
+  }
+}
 
 // Function to send message to API
 const sendMessage = async () => {
-  if (!userMessage.value.trim() || isLoading.value) return
+  if (!userMessage.value.trim() || isStreaming.value) return
 
   // Clear previous error
   error.value = undefined
 
-  // Add user message to UI immediately
-  const userMsg: Message = {
-    role: 'user',
-    content: userMessage.value,
-  }
-  messages.value.push(userMsg)
-
-  // Store message and clear input
   const messageText = userMessage.value
+
+  // Add user message to UI immediately
+  messages.value.push({
+    role: 'user',
+    content: messageText,
+  })
+
+  // Clear input
   userMessage.value = ''
-  isLoading.value = true
+  isStreaming.value = true
+  streamingMessage.value = ''
 
   try {
-    // Call RAG query endpoint
-    const response = await apiClient.query({
-      query: messageText,
-      topK: 5,
-    })
+    if (isConnected.value && conversationId.value) {
+      // Use SignalR streaming
+      console.log('🚀 Using SignalR streaming...')
+      await connection.invoke('StreamQuery', messageText, conversationId.value)
+    } else {
+      // Fallback to HTTP
+      console.warn('⚠️ Using HTTP fallback (SignalR not connected)')
+      const response = await api.query({
+        query: messageText,
+        topK: 5,
+      })
 
-    // Add assistant response to UI
-    messages.value.push({
-      role: 'assistant',
-      content: response.answer,
-      sources: response.sources,
-    })
+      // Add assistant response to UI
+      messages.value.push({
+        role: 'assistant',
+        content: response.answer,
+        sources: response.sources,
+      })
+
+      isStreaming.value = false
+    }
   } catch (err) {
     console.error('Error sending message:', err)
 
@@ -62,8 +152,9 @@ const sendMessage = async () => {
       role: 'assistant',
       content: '❌ Virhe: ' + errorMessage,
     })
-  } finally {
-    isLoading.value = false
+
+    isStreaming.value = false
+    streamingMessage.value = ''
   }
 }
 </script>
@@ -72,7 +163,25 @@ const sendMessage = async () => {
   <div class="flex flex-col h-screen bg-gray-50">
     <!-- Header -->
     <header class="bg-white shadow-sm px-6 py-4">
-      <h1 class="text-2xl font-bold text-gray-800">RAG Agent Chat</h1>
+      <div class="flex items-center justify-between">
+        <h1 class="text-2xl font-bold text-gray-800">RAG Agent Chat</h1>
+
+        <!-- Connection Status -->
+        <div
+          v-if="isConnected"
+          class="flex items-center gap-2 px-3 py-1 bg-green-100 text-green-800 rounded-full text-sm"
+        >
+          <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
+          <span>Real-time streaming</span>
+        </div>
+        <div
+          v-else
+          class="flex items-center gap-2 px-3 py-1 bg-yellow-100 text-yellow-800 rounded-full text-sm"
+        >
+          <span class="w-2 h-2 bg-yellow-500 rounded-full"></span>
+          <span>HTTP fallback</span>
+        </div>
+      </div>
     </header>
 
     <!-- Messages Area -->
@@ -95,7 +204,7 @@ const sendMessage = async () => {
           v-if="msg.sources && msg.sources.length > 0"
           class="mt-3 pt-3 border-t border-gray-200"
         >
-          <div class="text-sm font-semibold mb-2">Lähteet:</div>
+          <div class="text-sm font-semibold mb-2">📚 Lähteet:</div>
           <div class="space-y-2">
             <div
               v-for="(source, idx) in msg.sources"
@@ -105,11 +214,11 @@ const sendMessage = async () => {
               <a
                 :href="source.url"
                 target="_blank"
-                class="text-blue-600 hover:underline font-medium"
+                class="text-blue-600 hover:underline font-medium block mb-1"
               >
                 {{ source.url }}
               </a>
-              <div class="text-gray-600 text-xs mt-1">
+              <div class="text-gray-600 text-xs">
                 Relevanssi: {{ (source.relevanceScore * 100).toFixed(1) }}%
               </div>
             </div>
@@ -117,13 +226,34 @@ const sendMessage = async () => {
         </div>
       </div>
 
+      <!-- Streaming Message -->
+      <div v-if="streamingMessage" class="p-4 rounded-lg max-w-2xl bg-white shadow-sm">
+        <div class="font-semibold mb-1 flex items-center gap-2">
+          <span>AI Assistentti</span>
+          <span class="text-xs text-gray-500">(streaming...)</span>
+        </div>
+        <div class="whitespace-pre-wrap">
+          {{ streamingMessage }}
+          <span class="inline-block w-2 h-4 bg-gray-400 animate-pulse ml-1">▋</span>
+        </div>
+      </div>
+
       <!-- Empty state -->
-      <div v-if="messages.length === 0" class="text-center text-gray-500 mt-20">
-        Aloita keskustelu kirjoittamalla viesti alle 👇
+      <div
+        v-if="messages.length === 0 && !streamingMessage"
+        class="text-center text-gray-500 mt-20"
+      >
+        <p class="text-lg mb-2">Aloita keskustelu kirjoittamalla viesti alle 👇</p>
+        <p class="text-sm text-gray-400">
+          {{ isConnected ? '✨ Real-time streaming käytössä' : '💬 HTTP-tila käytössä' }}
+        </p>
       </div>
 
       <!-- Loading indicator -->
-      <div v-if="isLoading" class="flex items-center space-x-2 text-gray-500">
+      <div
+        v-if="isStreaming && !streamingMessage"
+        class="flex items-center space-x-2 text-gray-500"
+      >
         <div class="animate-spin rounded-full h-5 w-5 border-b-2 border-gray-900"></div>
         <span>Käsitellään kysymystä...</span>
       </div>
@@ -137,16 +267,24 @@ const sendMessage = async () => {
           @keyup.enter="sendMessage"
           type="text"
           placeholder="Kirjoita viesti..."
-          :disabled="isLoading"
+          :disabled="isStreaming"
           class="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
         />
         <button
           @click="sendMessage"
-          :disabled="isLoading || !userMessage.trim()"
+          :disabled="isStreaming || !userMessage.trim()"
           class="px-6 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
         >
-          {{ isLoading ? 'Lähettää...' : 'Lähetä' }}
+          {{ isStreaming ? 'Lähettää...' : 'Lähetä' }}
         </button>
+      </div>
+
+      <!-- Error Display -->
+      <div
+        v-if="error"
+        class="max-w-4xl mx-auto mt-2 p-3 bg-red-100 text-red-700 rounded-lg text-sm"
+      >
+        {{ error }}
       </div>
     </div>
   </div>
