@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick } from 'vue'
 import { useChatHub } from '@/composables/useChatHub'
 import { useApi } from '@/composables/useApi'
 import type { Message } from '@/types/api'
@@ -15,22 +15,42 @@ const streamingMessage = ref('')
 const isStreaming = ref(false)
 const error = ref<string>()
 
-onMounted(async () => {
-  // Connect to SignalR
-  try {
-    await connect()
-    console.log('✅ SignalR connected - real-time streaming enabled')
-  } catch (err) {
-    console.warn('⚠️ SignalR not available, will use HTTP fallback')
+// Chunk queue for smooth streaming
+let chunkQueue: string[] = []
+let isProcessingQueue = false
+
+async function processChunkQueue() {
+  if (isProcessingQueue) return
+  isProcessingQueue = true
+
+  while (chunkQueue.length > 0) {
+    const chunk = chunkQueue.shift()
+    if (chunk) {
+      streamingMessage.value += chunk
+      await nextTick()
+      // Small delay for smooth visual streaming
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
   }
 
-  // Setup SignalR event handlers
+  isProcessingQueue = false
+}
+
+onMounted(async () => {
+  // Setup SignalR event handlers BEFORE connecting
   connection.on('ReceiveChunk', (chunk: string) => {
-    streamingMessage.value += chunk
+    console.log('📝 Received chunk:', chunk)
+    chunkQueue.push(chunk)
+    processChunkQueue()
   })
 
   connection.on('ReceiveComplete', async () => {
-    isStreaming.value = false
+    console.log('✅ Stream complete')
+
+    // Wait for queue to finish processing
+    while (chunkQueue.length > 0 || isProcessingQueue) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
 
     // Add the completed message to history
     if (streamingMessage.value) {
@@ -38,17 +58,16 @@ onMounted(async () => {
         role: 'assistant',
         content: streamingMessage.value,
       })
-      streamingMessage.value = ''
     }
 
-    // Reload conversation history if needed
-    if (conversationId.value) {
-      await loadHistory(conversationId.value)
-    }
+    // Clear streaming state
+    streamingMessage.value = ''
+    isStreaming.value = false
+    chunkQueue = []
   })
 
   connection.on('ReceiveError', (errorMsg: string) => {
-    console.error('SignalR streaming error:', errorMsg)
+    console.error('❌ SignalR streaming error:', errorMsg)
     isStreaming.value = false
     streamingMessage.value = ''
     error.value = errorMsg
@@ -58,6 +77,15 @@ onMounted(async () => {
       content: '❌ Virhe: ' + errorMsg,
     })
   })
+
+  // Connect to SignalR
+  try {
+    await connect()
+    console.log('✅ SignalR connected to:', connection.baseUrl)
+    console.log('📡 Connection state:', connection.state)
+  } catch (err) {
+    console.warn('⚠️ SignalR not available, will use HTTP fallback:', err)
+  }
 
   // Load or create conversation
   await initConversation()
@@ -71,14 +99,16 @@ async function initConversation() {
   try {
     const conversations = await api.getConversations()
 
-    if (conversations.length > 0) {
+    if (conversations && conversations.length > 0 && conversations[0]) {
       conversationId.value = conversations[0].id
       await loadHistory(conversations[0].id)
     } else {
       const newConv = await api.createConversation('New Chat')
-      conversationId.value = newConv.id
+      if (newConv) {
+        conversationId.value = newConv.id
+      }
     }
-  } catch (err) {
+  } catch (err: unknown) {
     console.error('Failed to initialize conversation:', err)
     // Continue without conversation ID - HTTP fallback will still work
   }
@@ -87,8 +117,10 @@ async function initConversation() {
 async function loadHistory(id: string) {
   try {
     const history = await api.getConversationHistory(id)
-    messages.value = history
-  } catch (err) {
+    if (history) {
+      messages.value = history
+    }
+  } catch (err: unknown) {
     console.error('Failed to load conversation history:', err)
   }
 }
@@ -117,10 +149,15 @@ const sendMessage = async () => {
     if (isConnected.value && conversationId.value) {
       // Use SignalR streaming
       console.log('🚀 Using SignalR streaming...')
+      console.log('📡 Connection state:', connection.state)
+      console.log('💬 ConversationId:', conversationId.value)
+      console.log('❓ Query:', messageText)
       await connection.invoke('StreamQuery', messageText, conversationId.value)
     } else {
       // Fallback to HTTP
-      console.warn('⚠️ Using HTTP fallback (SignalR not connected)')
+      console.warn('⚠️ Using HTTP fallback')
+      console.warn('   - isConnected:', isConnected.value)
+      console.warn('   - conversationId:', conversationId.value)
       const response = await api.query({
         query: messageText,
         topK: 5,
@@ -135,7 +172,7 @@ const sendMessage = async () => {
 
       isStreaming.value = false
     }
-  } catch (err) {
+  } catch (err: unknown) {
     console.error('Error sending message:', err)
 
     let errorMessage = 'Virhe lähetettäessä viestiä. Tarkista että API on käynnissä.'
@@ -227,13 +264,13 @@ const sendMessage = async () => {
       </div>
 
       <!-- Streaming Message -->
-      <div v-if="streamingMessage" class="p-4 rounded-lg max-w-2xl bg-white shadow-sm">
+      <div v-if="isStreaming" class="p-4 rounded-lg max-w-2xl bg-white shadow-sm">
         <div class="font-semibold mb-1 flex items-center gap-2">
           <span>AI Assistentti</span>
           <span class="text-xs text-gray-500">(streaming...)</span>
         </div>
         <div class="whitespace-pre-wrap">
-          {{ streamingMessage }}
+          {{ streamingMessage || '...' }}
           <span class="inline-block w-2 h-4 bg-gray-400 animate-pulse ml-1">▋</span>
         </div>
       </div>
